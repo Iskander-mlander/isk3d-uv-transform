@@ -3,14 +3,16 @@
 bl_info = {
     "name": "ISK3d UV Transform",
     "author": "ISK3d",
-    "version": (1, 3, 1),
+    "version": (1, 4, 1),
     "blender": (5, 2, 0),
     "location": "View3D > Sidebar > ISK3d",
-    "description": "Desplaza y estira las UV del objeto o de las caras seleccionadas",
+    "description": "Desplaza, estira y proyecta las UV del objeto o de las caras seleccionadas",
     "category": "Object",
 }
 
+import bmesh
 import bpy
+import math
 from bpy.props import (
     BoolProperty,
     EnumProperty,
@@ -115,26 +117,51 @@ def _ensure_base(ob, props):
     me = ob.data
     attr = _valid_attr(me)
     if attr is not None:
+        if not props.base_valid or not props.base_layer:
+            me.attributes.remove(attr)
+            attr = None
+    if attr is not None:
         bounds = _attr_bounds(attr)
         if _usable_bounds(bounds):
             if props.base_layer and props.base_layer != layer.name:
                 if _capture_base(ob, props, layer):
-                    _reset_props(props)
                     return layer
                 return None
-            if not props.base_valid or not props.base_layer:
-                props.pivot_u = (bounds[0] + bounds[1]) * 0.5
-                props.pivot_v = (bounds[2] + bounds[3]) * 0.5
-                props.base_layer = layer.name
-                props.base_valid = True
             return layer
         me.attributes.remove(attr)
         props.base_valid = False
 
     if _capture_base(ob, props, layer):
-        _reset_props(props)
         return layer
     return None
+
+
+def _base_ready(ob, props):
+    layer = _active_uv(ob)
+    if layer is None:
+        return False
+    if not props.base_valid or props.base_layer != layer.name:
+        return False
+    me = ob.data
+    attr = me.attributes.get(BASE_ATTR)
+    if attr is None:
+        return False
+    return (
+        attr.data_type == "FLOAT_VECTOR"
+        and attr.domain == "CORNER"
+        and len(attr.data) == len(me.loops)
+    )
+
+
+def _invalidate_base(ob, props):
+    me = ob.data
+    attr = me.attributes.get(BASE_ATTR)
+    if attr is not None:
+        me.attributes.remove(attr)
+    props.base_valid = False
+    props.base_layer = ""
+    _reset_props(props)
+    me.update()
 
 
 def _selected_loop_indices(me):
@@ -192,6 +219,35 @@ def _update(self, context):
     if layer is None:
         return
     _apply(ob, self, layer)
+
+
+def _view3d_override(context):
+    area = context.area
+    if area is None or area.type != "VIEW_3D":
+        screen = context.screen
+        area = None
+        if screen is not None:
+            area = next((a for a in screen.areas if a.type == "VIEW_3D"), None)
+    if area is None:
+        return None
+    region = next((r for r in area.regions if r.type == "WINDOW"), None)
+    if region is None:
+        return None
+    return {"area": area, "region": region, "space_data": area.spaces.active}
+
+
+def _set_active_face(me):
+    bm = bmesh.from_edit_mesh(me)
+    bm.faces.ensure_lookup_table()
+    active = bm.faces.active
+    if active is None or not active.select or len(active.verts) != 4:
+        active = next((f for f in bm.faces if f.select and len(f.verts) == 4), None)
+        if active is None:
+            raise RuntimeError(
+                "Follow Active Quads necesita una cara activa cuadrada; selecciona un quad"
+            )
+        bm.faces.active = active
+    bmesh.update_edit_mesh(me)
 
 
 class ISK3D_UVTransformProps(PropertyGroup):
@@ -252,6 +308,53 @@ class ISK3D_UVTransformProps(PropertyGroup):
         precision=4,
         step=1,
         update=_update,
+    )
+    proj_direction: EnumProperty(
+        name="Eje",
+        description="Orientacion de las proyecciones cilindrica y esferica",
+        items=(
+            ("OBJECT", "Objeto", "Usar los ejes locales del objeto"),
+            ("VIEW", "Vista", "Usar la vista actual del visor 3D"),
+        ),
+        default="OBJECT",
+    )
+    proj_fit_bounds: BoolProperty(
+        name="Ajustar a 0-1",
+        description="Escalar el resultado para ocupar el rango UV 0-1",
+        default=False,
+    )
+    smart_angle: FloatProperty(
+        name="Smart angulo",
+        description="Angulo maximo entre caras para Smart UV Project",
+        default=66.0,
+        min=1.0,
+        max=89.0,
+    )
+    smart_margin: FloatProperty(
+        name="Smart margen",
+        description="Margen entre islas de Smart UV Project",
+        default=0.02,
+        min=0.0,
+        max=1.0,
+        precision=4,
+    )
+    unwrap_method: EnumProperty(
+        name="Unwrap",
+        description="Metodo de desplegado",
+        items=(
+            ("ANGLE_BASED", "Angle Based", "Desplegado por angulos"),
+            ("CONFORMAL", "Conformal", "Desplegado conformal"),
+            ("MINIMUM_STRETCH", "Minimum Stretch", "Minimo estiramiento"),
+        ),
+        default="ANGLE_BASED",
+    )
+    unwrap_margin: FloatProperty(
+        name="Margen",
+        description="Margen del desplegado",
+        default=0.001,
+        min=0.0,
+        max=1.0,
+        precision=4,
     )
     pivot_u: FloatProperty(default=0.0, options={"HIDDEN"})
     pivot_v: FloatProperty(default=0.0, options={"HIDDEN"})
@@ -317,6 +420,247 @@ class ISK3D_OT_uv_capture_base(Operator):
         return {"FINISHED"}
 
 
+class ISK3D_OT_uv_toggle_edit(Operator):
+    bl_idname = "isk3d.uv_toggle_edit"
+    bl_label = "Cambiar Object/Edit Mode"
+    bl_description = "Cambia de modo sin depender del atajo Tab sobre la barra lateral"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        ob = context.active_object
+        return ob is not None and ob.type == "MESH"
+
+    def execute(self, context):
+        ob = context.active_object
+        target = "EDIT" if ob.mode == "OBJECT" else "OBJECT"
+        try:
+            bpy.ops.object.mode_set(mode=target)
+        except RuntimeError as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
+class ISK3D_OT_uv_project(Operator):
+    bl_idname = "isk3d.uv_project"
+    bl_label = "Proyectar UV"
+    bl_description = "Aplica una proyeccion o desplegado UV a las caras del ambito"
+    bl_options = {"REGISTER", "UNDO"}
+
+    method: EnumProperty(
+        items=(
+            ("CUBE", "Cubo", ""),
+            ("CYLINDER", "Cilindro", ""),
+            ("SPHERE", "Esfera", ""),
+            ("UNWRAP", "Unwrap", ""),
+            ("SMART", "Smart UV", ""),
+            ("LIGHTMAP", "Lightmap", ""),
+            ("VIEW", "Desde vista", ""),
+            ("VIEW_BOUNDS", "Vista bounds", ""),
+            ("FOLLOW", "Seguir cara activa", ""),
+        ),
+        default="CUBE",
+    )
+
+    @classmethod
+    def poll(cls, context):
+        ob = context.active_object
+        return ob is not None and ob.type == "MESH"
+
+    def _run(self, context, props):
+        ob = context.active_object
+        me = ob.data
+        direction = (
+            "ALIGN_TO_OBJECT" if props.proj_direction == "OBJECT" else "VIEW_ON_EQUATOR"
+        )
+        fit = props.proj_fit_bounds
+
+        if self.method == "CUBE":
+            bpy.ops.uv.cube_project(
+                cube_size=1.0,
+                correct_aspect=True,
+                clip_to_bounds=False,
+                scale_to_bounds=fit,
+            )
+        elif self.method == "CYLINDER":
+            bpy.ops.uv.cylinder_project(
+                direction=direction,
+                align="POLAR_ZX",
+                pole="PINCH",
+                seam=False,
+                radius=1.0,
+                correct_aspect=True,
+                clip_to_bounds=False,
+                scale_to_bounds=fit,
+            )
+        elif self.method == "SPHERE":
+            bpy.ops.uv.sphere_project(
+                direction=direction,
+                align="POLAR_ZX",
+                pole="PINCH",
+                seam=False,
+                correct_aspect=True,
+                clip_to_bounds=False,
+                scale_to_bounds=fit,
+            )
+        elif self.method == "UNWRAP":
+            bpy.ops.uv.unwrap(
+                method=props.unwrap_method,
+                fill_holes=True,
+                correct_aspect=True,
+                margin_method="SCALED",
+                margin=props.unwrap_margin,
+                no_flip=False,
+                iterations=10,
+            )
+        elif self.method == "SMART":
+            bpy.ops.uv.smart_project(
+                angle_limit=math.radians(props.smart_angle),
+                margin_method="SCALED",
+                island_margin=props.smart_margin,
+                area_weight=0.0,
+                correct_aspect=True,
+                scale_to_bounds=fit,
+            )
+        elif self.method == "LIGHTMAP":
+            bpy.ops.uv.lightmap_pack(
+                PREF_CONTEXT="SEL_FACES",
+                PREF_PACK_IN_ONE=True,
+                PREF_NEW_UVLAYER=False,
+                PREF_BOX_DIV=12,
+                PREF_MARGIN_DIV=0.1,
+            )
+        elif self.method == "VIEW":
+            override = _view3d_override(context)
+            if override is None:
+                raise RuntimeError("Abre un visor 3D para proyectar desde la vista")
+            with context.temp_override(**override):
+                bpy.ops.uv.project_from_view(
+                    camera_bounds=False,
+                    correct_aspect=True,
+                    clip_to_bounds=False,
+                    scale_to_bounds=False,
+                )
+        elif self.method == "VIEW_BOUNDS":
+            override = _view3d_override(context)
+            if override is None:
+                raise RuntimeError("Abre un visor 3D para proyectar desde la vista")
+            with context.temp_override(**override):
+                bpy.ops.uv.project_from_view(
+                    camera_bounds=False,
+                    correct_aspect=True,
+                    clip_to_bounds=False,
+                    scale_to_bounds=True,
+                )
+        elif self.method == "FOLLOW":
+            _set_active_face(me)
+            bpy.ops.uv.follow_active_quads(mode="LENGTH_AVERAGE")
+
+    def execute(self, context):
+        ob = context.active_object
+        if ob is None or ob.type != "MESH":
+            self.report({"ERROR"}, "Selecciona un objeto de malla")
+            return {"CANCELLED"}
+        if not hasattr(ob, "isk3d_uv_transform"):
+            self.report({"ERROR"}, "El addon no esta registrado en este objeto")
+            return {"CANCELLED"}
+
+        me = ob.data
+        layer = _active_uv(ob)
+        if layer is None:
+            self.report({"ERROR"}, "El objeto no tiene capa UV")
+            return {"CANCELLED"}
+
+        props = ob.isk3d_uv_transform
+        was_mode = ob.mode
+        if was_mode == "OBJECT":
+            if props.scope == "FACES" and not any(p.select for p in me.polygons):
+                self.report({"ERROR"}, "Selecciona al menos una cara")
+                return {"CANCELLED"}
+            try:
+                bpy.ops.object.mode_set(mode="EDIT")
+            except RuntimeError as exc:
+                self.report({"ERROR"}, str(exc))
+                return {"CANCELLED"}
+
+        error = ""
+        try:
+            try:
+                bpy.ops.mesh.select_mode(type="FACE")
+            except RuntimeError:
+                pass
+            if props.scope == "OBJECT":
+                bpy.ops.mesh.select_all(action="SELECT")
+            elif not any(p.select for p in me.polygons):
+                raise RuntimeError("Selecciona al menos una cara")
+            self._run(context, props)
+        except RuntimeError as exc:
+            error = str(exc)
+
+        if was_mode == "OBJECT":
+            try:
+                bpy.ops.object.mode_set(mode="OBJECT")
+            except RuntimeError:
+                pass
+
+        if error:
+            self.report({"ERROR"}, error)
+            return {"CANCELLED"}
+
+        _invalidate_base(ob, props)
+        if was_mode == "OBJECT":
+            layer = _active_uv(ob)
+            if layer is not None and _capture_base(ob, props, layer):
+                _reset_props(props)
+        return {"FINISHED"}
+
+
+def _draw_scope(layout, props, ob, edit_mode):
+    box = layout.box()
+    box.label(text="Aplicar a")
+    box.prop(props, "scope", expand=True)
+    if props.scope == "FACES":
+        count = sum(1 for poly in ob.data.polygons if poly.select)
+        if count:
+            box.label(text=f"{count} caras seleccionadas", icon="FACESEL")
+        else:
+            box.label(text="Selecciona caras en Edit Mode", icon="INFO")
+        if not edit_mode:
+            box.label(text="Luego vuelve a Object Mode")
+
+
+def _draw_projections(layout, props):
+    box = layout.box()
+    box.label(text="Proyecciones UV", icon="UV")
+    col = box.column(align=True)
+
+    row = col.row(align=True)
+    row.operator("isk3d.uv_project", text="Cubo").method = "CUBE"
+    row.operator("isk3d.uv_project", text="Cilindro").method = "CYLINDER"
+    row.operator("isk3d.uv_project", text="Esfera").method = "SPHERE"
+
+    row = col.row(align=True)
+    row.operator("isk3d.uv_project", text="Unwrap").method = "UNWRAP"
+    row.operator("isk3d.uv_project", text="Smart UV").method = "SMART"
+    row.operator("isk3d.uv_project", text="Lightmap").method = "LIGHTMAP"
+
+    row = col.row(align=True)
+    row.operator("isk3d.uv_project", text="Desde vista").method = "VIEW"
+    row.operator("isk3d.uv_project", text="Vista bounds").method = "VIEW_BOUNDS"
+    row.operator("isk3d.uv_project", text="Seguir cara").method = "FOLLOW"
+
+    col.separator()
+    col.prop(props, "proj_direction")
+    col.prop(props, "proj_fit_bounds")
+    col.prop(props, "smart_angle")
+    col.prop(props, "smart_margin")
+    col.prop(props, "unwrap_method")
+    col.prop(props, "unwrap_margin")
+    col.label(text="El ambito es 'Aplicar a'", icon="INFO")
+    col.label(text="'Desde vista' usa la vista actual del visor 3D")
+
+
 class ISK3D_PT_uv_shortcuts(Panel):
     bl_label = "Atajos: seleccionar caras"
     bl_idname = "ISK3D_PT_uv_shortcuts"
@@ -329,7 +673,10 @@ class ISK3D_PT_uv_shortcuts(Panel):
     def draw(self, context):
         layout = self.layout
         col = layout.column(align=True)
-        col.label(text="Tab: entrar / salir de Edit Mode")
+        col.label(text="Tab: entrar / salir de Edit Mode", icon="INFO")
+        col.label(text="Solo funciona con el raton sobre el visor 3D")
+        col.label(text="Desde la barra lateral usa el boton del panel")
+        col.separator()
         col.label(text="3: modo de seleccion de caras")
         col.label(text="A: seleccionar todo")
         col.label(text="Alt+A: deseleccionar todo")
@@ -354,8 +701,22 @@ class ISK3D_PT_uv_transform(Panel):
         if ob is None or ob.type != "MESH":
             layout.label(text="Selecciona un objeto de malla", icon="INFO")
             return
+        if not hasattr(ob, "isk3d_uv_transform"):
+            layout.label(text="El addon no esta registrado", icon="ERROR")
+            return
+
+        props = ob.isk3d_uv_transform
         if ob.mode != "OBJECT":
-            layout.label(text="Sal de Edit Mode", icon="ERROR")
+            layout.label(text=f"{ob.name} - Edit Mode", icon="EDITMODE_HLT")
+            layout.operator(
+                "isk3d.uv_toggle_edit",
+                text="Volver a Object Mode (Tab)",
+                icon="OBJECT_DATAMODE",
+            )
+            _draw_scope(layout, props, ob, True)
+            _draw_projections(layout, props)
+            layout.separator()
+            layout.label(text="Los sliders UV requieren Object Mode", icon="INFO")
             return
 
         layer = _active_uv(ob)
@@ -363,24 +724,13 @@ class ISK3D_PT_uv_transform(Panel):
             layout.label(text="El objeto no tiene UV", icon="ERROR")
             return
 
-        props = ob.isk3d_uv_transform
-        base_ok = _ensure_base(ob, props) is not None
-        if not base_ok:
-            layout.label(text="UV base no validas", icon="ERROR")
+        if not _base_ready(ob, props):
+            layout.label(text="Base UV pendiente: mueve un slider", icon="INFO")
 
         layout.label(text=ob.name)
         layout.label(text=f"Capa UV: {layer.name}")
 
-        box = layout.box()
-        box.label(text="Aplicar a")
-        box.prop(props, "scope", expand=True)
-        if props.scope == "FACES":
-            count = sum(1 for poly in ob.data.polygons if poly.select)
-            if count:
-                box.label(text=f"{count} caras seleccionadas", icon="FACESEL")
-            else:
-                box.label(text="Selecciona caras en Edit Mode", icon="INFO")
-            box.label(text="Luego vuelve a Object Mode")
+        _draw_scope(layout, props, ob, False)
 
         box = layout.box()
         box.label(text="Desplazar textura")
@@ -403,11 +753,21 @@ class ISK3D_PT_uv_transform(Panel):
             "isk3d.uv_transform_capture_base", text="Fijar UV actuales", icon="UV"
         )
 
+        layout.separator()
+        layout.operator(
+            "isk3d.uv_toggle_edit",
+            text="Entrar en Edit Mode para seleccionar caras",
+            icon="EDITMODE_HLT",
+        )
+        _draw_projections(layout, props)
+
 
 classes = (
     ISK3D_UVTransformProps,
     ISK3D_OT_uv_transform_reset,
     ISK3D_OT_uv_capture_base,
+    ISK3D_OT_uv_toggle_edit,
+    ISK3D_OT_uv_project,
     ISK3D_PT_uv_transform,
     ISK3D_PT_uv_shortcuts,
 )
